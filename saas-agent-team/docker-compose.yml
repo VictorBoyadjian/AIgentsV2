@@ -1,0 +1,210 @@
+# =============================================================================
+# Docker Compose — SaaS Agent Team
+# Full stack: API, Workers, Redis, PostgreSQL, Weaviate, Prometheus, Grafana
+# =============================================================================
+
+services:
+  # -------------------------------------------------------------------------
+  # Application API
+  # -------------------------------------------------------------------------
+  app:
+    build: .
+    container_name: saas-agent-api
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://saas_agent:password@postgres:5432/saas_agent_db
+      - DATABASE_SYNC_URL=postgresql://saas_agent:password@postgres:5432/saas_agent_db
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - WEAVIATE_URL=http://weaviate:8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      weaviate:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - saas-network
+
+  # -------------------------------------------------------------------------
+  # Celery Worker — processes async agent tasks and batch jobs
+  # -------------------------------------------------------------------------
+  worker:
+    build: .
+    container_name: saas-agent-worker
+    command: celery -A orchestration.task_queue.celery_app worker --loglevel=info --concurrency=4
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://saas_agent:password@postgres:5432/saas_agent_db
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - WEAVIATE_URL=http://weaviate:8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - saas-network
+
+  # -------------------------------------------------------------------------
+  # Celery Beat — periodic task scheduler
+  # Polls batch results every 30 min, budget alerts every 15 min
+  # -------------------------------------------------------------------------
+  beat:
+    build: .
+    container_name: saas-agent-beat
+    command: celery -A orchestration.task_queue.celery_app beat --loglevel=info
+    env_file:
+      - .env
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - saas-network
+
+  # -------------------------------------------------------------------------
+  # Redis — cache, Celery broker, session store
+  # -------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: saas-agent-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - saas-network
+
+  # -------------------------------------------------------------------------
+  # PostgreSQL — persistent state, cost history, task records
+  # -------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: saas-agent-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: saas_agent
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: saas_agent_db
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U saas_agent -d saas_agent_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - saas-network
+
+  # -------------------------------------------------------------------------
+  # Weaviate — vector database for RAG / semantic search
+  # -------------------------------------------------------------------------
+  weaviate:
+    image: cr.weaviate.io/semitechnologies/weaviate:1.27.6
+    container_name: saas-agent-weaviate
+    ports:
+      - "8080:8080"
+      - "50051:50051"
+    environment:
+      QUERY_DEFAULTS_LIMIT: 25
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH: "/var/lib/weaviate"
+      DEFAULT_VECTORIZER_MODULE: "text2vec-transformers"
+      ENABLE_MODULES: "text2vec-transformers"
+      TRANSFORMERS_INFERENCE_API: "http://t2v-transformers:8080"
+      CLUSTER_HOSTNAME: "node1"
+    volumes:
+      - weaviate-data:/var/lib/weaviate
+    depends_on:
+      - t2v-transformers
+    restart: unless-stopped
+    networks:
+      - saas-network
+
+  t2v-transformers:
+    image: cr.weaviate.io/semitechnologies/transformers-inference:sentence-transformers-all-MiniLM-L6-v2
+    container_name: saas-agent-t2v
+    environment:
+      ENABLE_CUDA: "0"
+    restart: unless-stopped
+    networks:
+      - saas-network
+
+  # -------------------------------------------------------------------------
+  # Prometheus — metrics collection
+  # -------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: saas-agent-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+    restart: unless-stopped
+    networks:
+      - saas-network
+
+  # -------------------------------------------------------------------------
+  # Grafana — dashboards and visualization
+  # -------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: saas-agent-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks:
+      - saas-network
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  redis-data:
+  postgres-data:
+  weaviate-data:
+  prometheus-data:
+  grafana-data:
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  saas-network:
+    driver: bridge
