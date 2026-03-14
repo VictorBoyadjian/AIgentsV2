@@ -22,7 +22,7 @@ dockerfilePath = "Dockerfile"
 watchPatterns = ["agents/**", "api/**", "core/**", "memory/**", "observability/**", "orchestration/**", "pyproject.toml", "Dockerfile"]
 
 [deploy]
-startCommand = "uvicorn api.main:app --host 0.0.0.0 --port $PORT --workers 2"
+startCommand = "bash -c 'uvicorn api.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 2'"
 healthcheckPath = "/health"
 healthcheckTimeout = 120
 numReplicas = 1
