@@ -1,7 +1,7 @@
 # =============================================================================
 # Multi-stage Dockerfile for SaaS Agent Team
 # =============================================================================
-FROM python:3.11-slim as builder
+FROM python:3.11-slim AS builder
 
 WORKDIR /app
 
@@ -11,17 +11,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy dependency specs first for layer caching
+# Copy dependency specs + minimal package skeleton for pip install
 COPY pyproject.toml ./
+RUN mkdir -p agents api core memory observability orchestration tests && \
+    touch agents/__init__.py api/__init__.py core/__init__.py \
+          memory/__init__.py observability/__init__.py orchestration/__init__.py \
+          tests/__init__.py
 
-# Install dependencies
+# Install ALL dependencies (prod + dev for testing in CI)
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir ".[dev]"
+    pip install --no-cache-dir "."
 
 # =============================================================================
 # Runtime stage
 # =============================================================================
-FROM python:3.11-slim as runtime
+FROM python:3.11-slim AS runtime
 
 WORKDIR /app
 
@@ -42,6 +46,9 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 # Copy application code
 COPY . .
 
+# Ensure scripts are executable
+RUN chmod +x start_worker.sh 2>/dev/null || true
+
 # Set ownership
 RUN chown -R appuser:appuser /app
 
@@ -53,12 +60,9 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
-
-# Expose port
+# Expose port (Railway injects $PORT at runtime)
 EXPOSE 8000
 
-# Run with exec form for proper signal handling
-CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+# Default command — Railway overrides via railway.toml startCommand
+# Using shell form so $PORT is resolved at runtime
+CMD uvicorn api.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 2

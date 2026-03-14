@@ -147,7 +147,7 @@ class LangSmithTracer:
     ) -> None:
         self._enabled: bool = False
         self._client: Any = None
-        self._project_name: str = "saas-agent-team"
+        self._project_name: str = "AIGentsV2"
 
         # Resolve configuration -------------------------------------------------
         try:
@@ -161,7 +161,7 @@ class LangSmithTracer:
 
             resolved_key = api_key or os.getenv("LANGSMITH_API_KEY", "")
             resolved_project = project_name or os.getenv(
-                "LANGSMITH_PROJECT", "saas-agent-team"
+                "LANGSMITH_PROJECT", "AIGentsV2"
             )
 
         if not resolved_key:
@@ -171,7 +171,7 @@ class LangSmithTracer:
             )
             return
 
-        self._project_name = resolved_project or "saas-agent-team"
+        self._project_name = resolved_project or "AIGentsV2"
 
         # Import and initialise the SDK -----------------------------------------
         try:

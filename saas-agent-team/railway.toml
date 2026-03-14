@@ -1,0 +1,30 @@
+# =============================================================================
+# Railway deployment configuration
+# =============================================================================
+# This configures the PRIMARY service (FastAPI API).
+#
+# Railway architecture for this project:
+#   1. This service (app)        -> FastAPI API server
+#   2. Worker service            -> Celery worker + beat (uses start_worker.sh)
+#   3. Railway Redis plugin      -> Cache + Celery broker
+#   4. Railway PostgreSQL plugin -> Persistent storage
+#
+# Inter-service communication on Railway:
+#   - Services in the same project share a private network
+#   - Use RAILWAY_PRIVATE_DOMAIN for internal service-to-service calls
+#   - Redis/PostgreSQL plugins provide connection URLs automatically
+#   - Set shared variables via Railway's "Shared Variables" feature
+# =============================================================================
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+watchPatterns = ["agents/**", "api/**", "core/**", "memory/**", "observability/**", "orchestration/**", "pyproject.toml", "Dockerfile"]
+
+[deploy]
+startCommand = "uvicorn api.main:app --host 0.0.0.0 --port $PORT --workers 2"
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+numReplicas = 1
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5

@@ -7,6 +7,8 @@ background agent task execution.
 
 from __future__ import annotations
 
+import asyncio
+
 from celery import Celery
 from celery.schedules import crontab
 
@@ -60,7 +62,6 @@ celery_app.conf.beat_schedule = {
 @celery_app.task(name="orchestration.task_queue.poll_all_pending_batches")
 def poll_all_pending_batches() -> dict[str, int]:
     """Poll all pending batch jobs for results."""
-    import asyncio
 
     async def _poll() -> dict[str, int]:
         from core.batch_processor import BatchProcessor
@@ -76,13 +77,12 @@ def poll_all_pending_batches() -> dict[str, int]:
 
         return {"polled_jobs": len(pending), "results_collected": results_count}
 
-    return asyncio.get_event_loop().run_until_complete(_poll())
+    return asyncio.run(_poll())
 
 
 @celery_app.task(name="orchestration.task_queue.generate_daily_cost_report")
 def generate_daily_cost_report() -> dict[str, float]:
     """Generate daily cost reports for all active projects."""
-    import asyncio
 
     async def _report() -> dict[str, float]:
         from core.cost_tracker import CostTracker
@@ -93,22 +93,24 @@ def generate_daily_cost_report() -> dict[str, float]:
         tracker = CostTracker()
         await tracker.initialize()
 
-        projects = await db.list_projects(status="active")
-        total_cost = 0.0
+        try:
+            projects = await db.list_projects(status="active")
+            total_cost = 0.0
 
-        for project in projects:
-            daily = await tracker.get_daily_cost(project.id)
-            total_cost += daily.total_cost_usd
+            for project in projects:
+                daily = await tracker.get_daily_cost(project.id)
+                total_cost += daily.total_cost_usd
 
-        return {"total_daily_cost_usd": total_cost, "projects_count": len(projects)}
+            return {"total_daily_cost_usd": total_cost, "projects_count": len(projects)}
+        finally:
+            await db.close()
 
-    return asyncio.get_event_loop().run_until_complete(_report())
+    return asyncio.run(_report())
 
 
 @celery_app.task(name="orchestration.task_queue.check_all_budget_alerts")
 def check_all_budget_alerts() -> dict[str, int]:
     """Check budget alerts for all active projects."""
-    import asyncio
 
     async def _check() -> dict[str, int]:
         from core.cost_tracker import CostTracker
@@ -119,16 +121,19 @@ def check_all_budget_alerts() -> dict[str, int]:
         tracker = CostTracker()
         await tracker.initialize()
 
-        projects = await db.list_projects(status="active")
-        total_alerts = 0
+        try:
+            projects = await db.list_projects(status="active")
+            total_alerts = 0
 
-        for project in projects:
-            alerts = await tracker.check_budget_alerts(project.id)
-            total_alerts += len(alerts)
+            for project in projects:
+                alerts = await tracker.check_budget_alerts(project.id)
+                total_alerts += len(alerts)
 
-        return {"projects_checked": len(projects), "alerts_triggered": total_alerts}
+            return {"projects_checked": len(projects), "alerts_triggered": total_alerts}
+        finally:
+            await db.close()
 
-    return asyncio.get_event_loop().run_until_complete(_check())
+    return asyncio.run(_check())
 
 
 @celery_app.task(name="orchestration.task_queue.execute_agent_task")
@@ -138,7 +143,6 @@ def execute_agent_task(
     task_data: dict,
 ) -> dict:
     """Execute an agent task asynchronously via Celery."""
-    import asyncio
 
     async def _execute() -> dict:
         from agents.base_agent import Task, TaskType
@@ -147,26 +151,30 @@ def execute_agent_task(
 
         manager = CrewManager()
         await manager.initialize()
-        agents = manager._create_agents(project_id)
 
-        agent = agents.get(agent_role)
-        if not agent:
-            return {"error": f"Unknown agent role: {agent_role}"}
+        try:
+            agents = manager._create_agents(project_id)
 
-        task = Task(
-            id=task_data.get("id", f"celery_{agent_role}"),
-            type=TaskType(task_data.get("type", "code_generation")),
-            description=task_data.get("description", ""),
-            complexity=TaskComplexity(task_data.get("complexity", "medium")),
-            project_id=project_id,
-            context=task_data.get("context", {}),
-        )
+            agent = agents.get(agent_role)
+            if not agent:
+                return {"error": f"Unknown agent role: {agent_role}"}
 
-        output = await agent.execute(task)
-        return {
-            "task_id": output.task_id,
-            "content": output.content[:5000],
-            "cost_usd": output.cost.real_cost_usd if output.cost else 0.0,
-        }
+            task = Task(
+                id=task_data.get("id", f"celery_{agent_role}"),
+                type=TaskType(task_data.get("type", "code_generation")),
+                description=task_data.get("description", ""),
+                complexity=TaskComplexity(task_data.get("complexity", "medium")),
+                project_id=project_id,
+                context=task_data.get("context", {}),
+            )
 
-    return asyncio.get_event_loop().run_until_complete(_execute())
+            output = await agent.execute(task)
+            return {
+                "task_id": output.task_id,
+                "content": output.content[:5000],
+                "cost_usd": output.cost.real_cost_usd if output.cost else 0.0,
+            }
+        finally:
+            await manager.shutdown()
+
+    return asyncio.run(_execute())

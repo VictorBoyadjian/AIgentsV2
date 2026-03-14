@@ -3,11 +3,19 @@ Application configuration using Pydantic Settings.
 
 All configuration is loaded from environment variables and .env files.
 No secrets are hardcoded. Every setting has a sensible default where possible.
+
+Railway deployment notes:
+- Railway plugins inject DATABASE_URL, REDIS_URL automatically
+- Railway provides RAILWAY_PRIVATE_DOMAIN for inter-service communication
+- Railway provides PORT for the service's listening port
+- DATABASE_URL from Railway uses postgresql:// which is rewritten to
+  postgresql+asyncpg:// for async support
 """
 
 from __future__ import annotations
 
 import json
+import os
 from enum import Enum
 from functools import lru_cache
 from typing import Any
@@ -117,7 +125,12 @@ class LLMConfig(BaseSettings):
 
 
 class DatabaseConfig(BaseSettings):
-    """Database connection configuration."""
+    """Database connection configuration.
+
+    On Railway, DATABASE_URL is injected by the PostgreSQL plugin in
+    ``postgresql://`` format.  We auto-rewrite it to ``postgresql+asyncpg://``
+    for SQLAlchemy async support.
+    """
 
     model_config = SettingsConfigDict(env_prefix="", env_file=".env", extra="ignore")
 
@@ -127,15 +140,55 @@ class DatabaseConfig(BaseSettings):
     db_max_overflow: int = 10
     db_pool_recycle: int = 3600
 
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def ensure_asyncpg_scheme(cls, v: str) -> str:
+        """Rewrite postgresql:// to postgresql+asyncpg:// if needed."""
+        if isinstance(v, str) and v.startswith("postgresql://"):
+            return v.replace("postgresql://", "postgresql+asyncpg://", 1)
+        return v
+
+    @field_validator("database_sync_url", mode="before")
+    @classmethod
+    def ensure_sync_scheme(cls, v: str) -> str:
+        """Ensure sync URL uses plain postgresql:// scheme."""
+        if isinstance(v, str) and v.startswith("postgresql+asyncpg://"):
+            return v.replace("postgresql+asyncpg://", "postgresql://", 1)
+        return v
+
 
 class RedisConfig(BaseSettings):
-    """Redis connection configuration."""
+    """Redis connection configuration.
+
+    On Railway, REDIS_URL is injected by the Redis plugin.
+    Celery broker/backend URLs default to the same Redis with different DBs.
+    """
 
     model_config = SettingsConfigDict(env_prefix="", env_file=".env", extra="ignore")
 
     redis_url: str = "redis://localhost:6379/0"
-    celery_broker_url: str = "redis://localhost:6379/1"
-    celery_result_backend: str = "redis://localhost:6379/2"
+    celery_broker_url: str = ""
+    celery_result_backend: str = ""
+
+    @field_validator("celery_broker_url", mode="before")
+    @classmethod
+    def default_celery_broker(cls, v: Any, info: Any) -> str:
+        """Default Celery broker to REDIS_URL with /1 database if not set."""
+        if v:
+            return v
+        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        base = redis_url.rsplit("/", 1)[0] if "/" in redis_url.split("://", 1)[-1] else redis_url
+        return f"{base}/1"
+
+    @field_validator("celery_result_backend", mode="before")
+    @classmethod
+    def default_celery_backend(cls, v: Any, info: Any) -> str:
+        """Default Celery result backend to REDIS_URL with /2 database if not set."""
+        if v:
+            return v
+        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        base = redis_url.rsplit("/", 1)[0] if "/" in redis_url.split("://", 1)[-1] else redis_url
+        return f"{base}/2"
 
 
 class WeaviateConfig(BaseSettings):
@@ -167,12 +220,16 @@ class ObservabilityConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="", env_file=".env", extra="ignore")
 
     langsmith_api_key: str = ""
-    langsmith_project: str = "saas-agent-team"
+    langsmith_project: str = "AIGentsV2"
     langsmith_tracing_v2: bool = True
 
 
 class APIConfig(BaseSettings):
-    """API server configuration."""
+    """API server configuration.
+
+    On Railway, PORT is injected automatically.
+    RAILWAY_PUBLIC_DOMAIN provides the external URL for CORS.
+    """
 
     model_config = SettingsConfigDict(env_prefix="", env_file=".env", extra="ignore")
 
@@ -183,13 +240,36 @@ class APIConfig(BaseSettings):
     secret_key: str = "change-me-in-production-use-a-real-secret-key"
     environment: Environment = Environment.DEVELOPMENT
 
+    @field_validator("api_port", mode="before")
+    @classmethod
+    def use_railway_port(cls, v: Any) -> int:
+        """Use Railway's PORT env var if available."""
+        port = os.getenv("PORT")
+        if port:
+            return int(port)
+        return int(v) if v else 8000
+
     @field_validator("api_cors_origins", mode="before")
     @classmethod
     def parse_cors_origins(cls, v: Any) -> list[str]:
-        """Parse CORS origins from JSON string or return list as-is."""
+        """Parse CORS origins from JSON string or return list as-is.
+
+        Automatically includes Railway's public domain if available.
+        """
+        origins: list[str]
         if isinstance(v, str):
-            return json.loads(v)  # type: ignore[no-any-return]
-        return v  # type: ignore[return-value]
+            origins = json.loads(v)
+        else:
+            origins = list(v) if v else ["http://localhost:3000"]
+
+        # Auto-add Railway public domain to CORS
+        railway_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN")
+        if railway_domain:
+            railway_url = f"https://{railway_domain}"
+            if railway_url not in origins:
+                origins.append(railway_url)
+
+        return origins
 
 
 class Settings(BaseSettings):

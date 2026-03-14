@@ -1,6 +1,9 @@
 # =============================================================================
 # Docker Compose — SaaS Agent Team
 # Full stack: API, Workers, Redis, PostgreSQL, Weaviate, Prometheus, Grafana
+#
+# This is for LOCAL DEVELOPMENT only.
+# For Railway deployment, see railway.toml and the README.
 # =============================================================================
 
 services:
@@ -21,6 +24,13 @@ services:
       - CELERY_BROKER_URL=redis://redis:6379/1
       - CELERY_RESULT_BACKEND=redis://redis:6379/2
       - WEAVIATE_URL=http://weaviate:8080
+      - ENVIRONMENT=development
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
     depends_on:
       postgres:
         condition: service_healthy
@@ -43,10 +53,12 @@ services:
       - .env
     environment:
       - DATABASE_URL=postgresql+asyncpg://saas_agent:password@postgres:5432/saas_agent_db
+      - DATABASE_SYNC_URL=postgresql://saas_agent:password@postgres:5432/saas_agent_db
       - REDIS_URL=redis://redis:6379/0
       - CELERY_BROKER_URL=redis://redis:6379/1
       - CELERY_RESULT_BACKEND=redis://redis:6379/2
       - WEAVIATE_URL=http://weaviate:8080
+      - ENVIRONMENT=development
     depends_on:
       postgres:
         condition: service_healthy
@@ -67,8 +79,12 @@ services:
     env_file:
       - .env
     environment:
+      - DATABASE_URL=postgresql+asyncpg://saas_agent:password@postgres:5432/saas_agent_db
+      - DATABASE_SYNC_URL=postgresql://saas_agent:password@postgres:5432/saas_agent_db
+      - REDIS_URL=redis://redis:6379/0
       - CELERY_BROKER_URL=redis://redis:6379/1
       - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - ENVIRONMENT=development
     depends_on:
       redis:
         condition: service_healthy
