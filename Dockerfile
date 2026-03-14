@@ -16,7 +16,8 @@ COPY pyproject.toml ./
 RUN mkdir -p agents api core memory observability orchestration tests && \
     touch agents/__init__.py api/__init__.py core/__init__.py \
           memory/__init__.py observability/__init__.py orchestration/__init__.py \
-          tests/__init__.py
+          tests/__init__.py && \
+    touch README.md
 
 # Install ALL dependencies (prod + dev for testing in CI)
 RUN pip install --no-cache-dir --upgrade pip && \
