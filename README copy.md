@@ -50,7 +50,6 @@ Four mechanisms work together to minimize LLM costs:
 
 ```bash
 # Clone and enter project
-cd saas-agent-team
 
 # Copy environment config
 cp .env.example .env

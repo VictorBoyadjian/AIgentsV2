@@ -8,6 +8,8 @@ checks, cache warmup, and human-in-the-loop checkpoints.
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, TypedDict
@@ -24,8 +26,11 @@ from agents.security_agent import SecurityAgent
 from agents.base_agent import AgentOutput
 from core.batch_processor import BatchProcessor
 from core.cache_manager import CacheManager
-from core.config import get_settings
+from core.config import get_settings, TaskComplexity
 from core.cost_tracker import CostTracker
+from core.tools.github_tool import GitHubTool
+from core.tools.code_sandbox import CodeSandbox
+from core.tools.deploy_tool import DeployTool
 
 logger = structlog.get_logger(__name__)
 
@@ -83,6 +88,18 @@ class WorkflowState:
     errors: list[str] = field(default_factory=list)
     budget_ok: bool = True
 
+    # GitHub tracking
+    github_repo_name: str = ""
+    github_repo_url: str = ""
+    github_branch: str = "main"
+
+    # Railway tracking
+    railway_project_id: str = ""
+    railway_deployment_url: str = ""
+
+    # Sandbox test execution results
+    sandbox_test_results: list[dict] = field(default_factory=list)
+
 
 # ---------------------------------------------------------------------------
 # Workflow Graph
@@ -114,6 +131,11 @@ class WorkflowGraph:
         self.qa_agent = QAAgent(project_id=project_id)
         self.security_agent = SecurityAgent(project_id=project_id)
         self.devops_agent = DevOpsAgent(project_id=project_id)
+
+        # Tools for autonomous workflow
+        self.github_tool = GitHubTool()
+        self.code_sandbox = CodeSandbox()
+        self.deploy_tool = DeployTool()
 
         self._human_callback: Any = None
 
@@ -229,7 +251,10 @@ class WorkflowGraph:
 
         # Extract features from PRD/architecture
         if not state.features:
-            state.features = [f"Feature {i+1}" for i in range(3)]
+            state.features = await self._extract_features_from_prd(state.prd_doc)
+            if not state.features:
+                state.features = ["Core API endpoints", "Authentication system", "Data models"]
+                logger.warning("workflow.feature_extraction_fallback")
 
         state.current_phase = WorkflowPhase.HUMAN_REVIEW_DESIGN
         return state
@@ -251,6 +276,9 @@ class WorkflowGraph:
             state.design_approved = True
 
         if state.design_approved:
+            # Create GitHub repository for the project
+            await self._setup_github_repo(state)
+
             # Warm cache with new context
             full_context = f"## PRD\n{state.prd_doc}\n\n## Architecture\n{state.architecture_doc}"
             await self.cache_manager.warm_cache("dev", full_context)
@@ -262,7 +290,7 @@ class WorkflowGraph:
         return state
 
     async def _phase_development(self, state: WorkflowState) -> WorkflowState:
-        """Development loop — implement features with parallel QA and security."""
+        """Development loop — implement features with GitHub commits and sandbox testing."""
         for feature in state.features:
             if feature in state.completed_features:
                 continue
@@ -273,27 +301,44 @@ class WorkflowGraph:
             dev_output = await self.dev_agent.generate_code(feature=feature)
             state.code_artifacts.update(dev_output.artifacts)
 
-            # 2. QA Agent: generate tests (batch — async)
+            # 2. Commit code artifacts to GitHub
+            if state.github_repo_name and dev_output.artifacts:
+                await self._commit_artifacts_to_github(
+                    state=state,
+                    files=dev_output.artifacts,
+                    message=f"feat: implement {feature}",
+                )
+
+            # 3. QA Agent: generate tests (blocking — need code immediately for E2B)
             qa_output = await self.qa_agent.write_e2e_tests(
                 feature=feature,
                 source_code=dev_output.content,
-                blocking=False,
+                blocking=True,
             )
-            if qa_output.metadata.get("is_batch"):
-                batch_id = qa_output.metadata.get("batch_job_id", "")
-                if batch_id:
-                    state.pending_batch_jobs.append(batch_id)
 
-            # 3. Security Agent: audit (batch — parallel)
+            # 4. Run generated tests in E2B sandbox
+            if qa_output.content and not qa_output.metadata.get("is_batch"):
+                sandbox_result = await self._run_tests_in_sandbox(
+                    test_code=qa_output.content,
+                    source_code=state.code_artifacts,
+                    feature_name=feature,
+                )
+                state.sandbox_test_results.append(sandbox_result)
+                state.test_results.append(
+                    f"[{feature}] {'PASSED' if sandbox_result['passed'] else 'FAILED'}: "
+                    f"{sandbox_result['stdout'][:500]}"
+                )
+
+            # 5. Security Agent: dependency check
             sec_output = await self.security_agent.check_dependencies(
-                dependencies=dev_output.content[:1000]
+                dependencies=dev_output.content
             )
             if sec_output.metadata.get("is_batch"):
                 batch_id = sec_output.metadata.get("batch_job_id", "")
                 if batch_id:
                     state.pending_batch_jobs.append(batch_id)
 
-            # 4. Budget check after each feature
+            # 6. Budget check after each feature
             alerts = await self.cost_tracker.check_budget_alerts(state.project_id)
             if self.cost_tracker.has_emergency_alert(alerts):
                 state.budget_ok = False
@@ -323,21 +368,81 @@ class WorkflowGraph:
         return state
 
     async def _phase_integration(self, state: WorkflowState) -> WorkflowState:
-        """Integration testing phase."""
+        """Integration testing + full security audit."""
         all_code = "\n\n".join(state.code_artifacts.values())
+
+        # 1. QA Agent: generate integration tests (blocking)
         qa_output = await self.qa_agent.write_e2e_tests(
             feature="Integration tests for all features",
             source_code=all_code[:5000],
             blocking=True,
         )
         state.test_results.append(qa_output.content)
+
+        # 2. Run integration tests in E2B sandbox
+        if qa_output.content:
+            integration_result = await self._run_tests_in_sandbox(
+                test_code=qa_output.content,
+                source_code=state.code_artifacts,
+                feature_name="integration",
+            )
+            state.sandbox_test_results.append(integration_result)
+
+        # 3. Full security audit on ALL code
+        try:
+            sec_output = await self.security_agent.audit_code(
+                code=all_code,
+                focus_areas="OWASP Top 10",
+            )
+            state.security_findings = sec_output.content
+            logger.info(
+                "workflow.security_audit_complete",
+                findings_length=len(state.security_findings),
+            )
+        except Exception as exc:
+            state.security_findings = f"Security audit failed: {exc}"
+            state.errors.append(f"Security audit error: {exc}")
+            logger.error("workflow.security_audit_error", error=str(exc))
+
+        # 4. Commit test files to GitHub
+        if state.github_repo_name and qa_output.artifacts:
+            await self._commit_artifacts_to_github(
+                state=state,
+                files=qa_output.artifacts,
+                message="test: add integration tests",
+            )
+
         state.current_phase = WorkflowPhase.DEPLOY
         return state
 
     async def _phase_deploy(self, state: WorkflowState) -> WorkflowState:
-        """Deployment phase — generate infra and deploy."""
-        # Generate Dockerfile (real-time)
-        await self.devops_agent.generate_dockerfile()
+        """Deployment phase — generate infra, commit to GitHub, deploy to Railway."""
+        # 1. Generate Dockerfile (real-time)
+        devops_output = await self.devops_agent.generate_dockerfile()
+
+        # 2. Store Dockerfile artifacts
+        if devops_output.artifacts:
+            state.code_artifacts.update(devops_output.artifacts)
+
+        # 3. Generate CI/CD pipeline
+        cicd_output = await self.devops_agent.generate_cicd_pipeline(
+            platform="github-actions",
+            tech_stack="Python/FastAPI",
+        )
+        if cicd_output.artifacts:
+            state.code_artifacts.update(cicd_output.artifacts)
+
+        # 4. Commit deployment files to GitHub
+        deploy_files = {**devops_output.artifacts, **cicd_output.artifacts}
+        if state.github_repo_name and deploy_files:
+            await self._commit_artifacts_to_github(
+                state=state,
+                files=deploy_files,
+                message="chore: add Dockerfile, CI/CD, and deployment config",
+            )
+
+        # 5. Deploy from GitHub to Railway
+        state.deployment_result = await self._deploy_to_railway(state)
 
         state.current_phase = WorkflowPhase.HUMAN_REVIEW_DEPLOY
         return state
@@ -351,6 +456,10 @@ class WorkflowGraph:
                     "code": state.code_artifacts,
                     "tests": state.test_results,
                     "security": state.security_findings,
+                    "deployment": state.deployment_result,
+                    "sandbox_results": state.sandbox_test_results,
+                    "deployment_url": state.railway_deployment_url,
+                    "github_repo": state.github_repo_url,
                 },
             )
             state.deploy_approved = decision.get("approved", False)
@@ -384,3 +493,201 @@ class WorkflowGraph:
         logger.info("workflow.cost_report_generated", total_cost=daily_report.total_cost_usd)
         state.current_phase = WorkflowPhase.COMPLETED
         return state
+
+    # ------------------------------------------------------------------
+    # Tool helper methods
+    # ------------------------------------------------------------------
+    async def _extract_features_from_prd(self, prd_text: str) -> list[str]:
+        """Extract feature names from the PRD using a cheap LLM call."""
+        try:
+            prompt = (
+                "Extract the list of feature names from this PRD. "
+                "Return ONLY a JSON array of short feature name strings, nothing else.\n\n"
+                f"PRD:\n{prd_text[:4000]}"
+            )
+            content, _ = await self.pm_agent.llm_router.call_llm(
+                agent_role="fallback",
+                messages=[{"role": "user", "content": prompt}],
+                task_complexity=TaskComplexity.SIMPLE,
+                max_tokens=500,
+                temperature=0.0,
+            )
+            cleaned = content.strip()
+            if cleaned.startswith("```"):
+                cleaned = re.sub(r"```\w*\n?", "", cleaned).strip()
+            features = json.loads(cleaned)
+            if isinstance(features, list) and all(isinstance(f, str) for f in features):
+                logger.info("workflow.features_extracted", count=len(features))
+                return features[:10]
+        except Exception as exc:
+            logger.warning("workflow.feature_extraction_failed", error=str(exc))
+        return []
+
+    async def _setup_github_repo(self, state: WorkflowState) -> None:
+        """Create a GitHub repository for the project. Degrades gracefully on failure."""
+        repo_name = f"saas-{state.project_id}"
+        try:
+            result = await self.github_tool.create_repository(
+                name=repo_name,
+                description=f"Auto-generated SaaS: {state.product_idea[:100]}",
+                private=True,
+                auto_init=True,
+            )
+            if result.success:
+                state.github_repo_name = result.data.get("full_name", repo_name)
+                state.github_repo_url = result.url or ""
+                logger.info("workflow.github_repo_created", repo=state.github_repo_name)
+
+                # Commit PRD and architecture docs as initial content
+                await self.github_tool.commit_files(
+                    repo_name=state.github_repo_name,
+                    branch="main",
+                    files={
+                        "docs/PRD.md": state.prd_doc,
+                        "docs/ARCHITECTURE.md": state.architecture_doc,
+                    },
+                    commit_message="docs: add PRD and architecture documents",
+                )
+            else:
+                state.errors.append(f"GitHub repo creation failed: {result.message}")
+                logger.warning("workflow.github_repo_failed", error=result.message)
+        except Exception as exc:
+            state.errors.append(f"GitHub setup error: {exc}")
+            logger.error("workflow.github_setup_error", error=str(exc))
+
+    async def _commit_artifacts_to_github(
+        self,
+        state: WorkflowState,
+        files: dict[str, str],
+        message: str,
+    ) -> None:
+        """Commit code artifacts to GitHub. No-op if GitHub is not configured."""
+        if not state.github_repo_name:
+            return
+        try:
+            result = await self.github_tool.commit_files(
+                repo_name=state.github_repo_name,
+                branch=state.github_branch,
+                files=files,
+                commit_message=message,
+            )
+            if result.success:
+                logger.info("workflow.code_committed", files=len(files))
+            else:
+                state.errors.append(f"GitHub commit failed: {result.message}")
+                logger.warning("workflow.commit_failed", error=result.message)
+        except Exception as exc:
+            state.errors.append(f"GitHub commit error: {exc}")
+            logger.error("workflow.commit_error", error=str(exc))
+
+    async def _run_tests_in_sandbox(
+        self,
+        test_code: str,
+        source_code: dict[str, str],
+        feature_name: str,
+    ) -> dict:
+        """Run tests in E2B sandbox. Returns structured result dict."""
+        try:
+            extracted_test = self._extract_test_code(test_code)
+            result = await self.code_sandbox.run_tests(
+                test_code=extracted_test,
+                source_code=source_code,
+                packages=["httpx", "pytest-asyncio"],
+            )
+            logger.info(
+                "workflow.sandbox_tests_completed",
+                feature=feature_name,
+                passed=result.success,
+                exit_code=result.exit_code,
+            )
+            return {
+                "feature": feature_name,
+                "passed": result.success,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "exit_code": result.exit_code,
+            }
+        except Exception as exc:
+            logger.error("workflow.sandbox_tests_error", feature=feature_name, error=str(exc))
+            return {
+                "feature": feature_name,
+                "passed": False,
+                "stdout": "",
+                "stderr": f"Sandbox execution error: {exc}",
+                "exit_code": -1,
+            }
+
+    @staticmethod
+    def _extract_test_code(content: str) -> str:
+        """Extract pytest code from LLM output that may contain markdown code blocks."""
+        pattern = r"```python(?::[\w/._-]+)?\n(.*?)```"
+        matches = re.findall(pattern, content, re.DOTALL)
+        if matches:
+            test_blocks = [m for m in matches if "test" in m.lower() or "pytest" in m.lower()]
+            if test_blocks:
+                return "\n\n".join(test_blocks)
+            return "\n\n".join(matches)
+        return content
+
+    async def _deploy_to_railway(self, state: WorkflowState) -> str:
+        """Create Railway project and deploy from GitHub. Returns status string."""
+        if not state.github_repo_url:
+            msg = "Skipping Railway deployment: no GitHub repository available"
+            logger.warning("workflow.deploy_skipped_no_repo")
+            return msg
+
+        try:
+            # Step 1: Create Railway project
+            project_name = f"saas-{state.project_id}"
+            project_result = await self.deploy_tool.create_project(name=project_name)
+            if not project_result.success:
+                msg = f"Railway project creation failed: {project_result.message}"
+                state.errors.append(msg)
+                return msg
+
+            state.railway_project_id = project_result.deployment_id or ""
+            logger.info("workflow.railway_project_created", id=state.railway_project_id)
+
+            # Step 2: Deploy from GitHub
+            deploy_result = await self.deploy_tool.deploy_from_github(
+                repo_url=state.github_repo_url,
+                branch=state.github_branch,
+            )
+            if not deploy_result.success:
+                msg = f"Railway deployment failed: {deploy_result.message}"
+                state.errors.append(msg)
+                return msg
+
+            service_id = deploy_result.deployment_id or ""
+
+            # Step 3: Set environment variables
+            settings = get_settings()
+            env_vars = {
+                "ENVIRONMENT": "production",
+                "SECRET_KEY": settings.api.secret_key,
+            }
+            await self.deploy_tool.set_environment_variables(
+                service_id=service_id,
+                env_vars=env_vars,
+            )
+
+            # Step 4: Check deployment status
+            if service_id:
+                await asyncio.sleep(5)
+                status = await self.deploy_tool.get_deployment_status(service_id)
+                state.railway_deployment_url = status.deployment_url or ""
+                return (
+                    f"Deployed to Railway. "
+                    f"Project: {project_name}, "
+                    f"Service: {service_id}, "
+                    f"Status: {status.message}, "
+                    f"URL: {state.railway_deployment_url or 'pending'}"
+                )
+
+            return f"Deployment triggered for {project_name}. Service ID: {service_id}"
+
+        except Exception as exc:
+            msg = f"Railway deployment error: {exc}"
+            state.errors.append(msg)
+            logger.error("workflow.railway_deploy_error", error=str(exc))
+            return msg
