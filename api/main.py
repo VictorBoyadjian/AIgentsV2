@@ -12,6 +12,7 @@ Run with::
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -43,7 +44,12 @@ logger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Initialise all infrastructure on startup; tear down on shutdown."""
+    """Initialise all infrastructure on startup; tear down on shutdown.
+
+    Each component has a 15-second timeout so that a slow or unreachable
+    dependency (DB, Redis, Weaviate) does not prevent the app from starting
+    and passing Railway's healthcheck.
+    """
     settings = get_app_settings()
     logger.info(
         "app.startup",
@@ -52,35 +58,27 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         port=settings.api.api_port,
     )
 
+    INIT_TIMEOUT = 15  # seconds per component
+
     # -- Startup ----------------------------------------------------------
     database = get_database()
     cost_tracker = get_cost_tracker()
     cache = get_cache()
     crew_manager = get_crew_manager()
 
-    try:
-        await database.initialize()
-        logger.info("app.component_ready", component="database")
-    except Exception as exc:
-        logger.error("app.database_init_failed", error=str(exc))
-
-    try:
-        await cost_tracker.initialize()
-        logger.info("app.component_ready", component="cost_tracker")
-    except Exception as exc:
-        logger.error("app.cost_tracker_init_failed", error=str(exc))
-
-    try:
-        await cache.initialize()
-        logger.info("app.component_ready", component="cache")
-    except Exception as exc:
-        logger.error("app.cache_init_failed", error=str(exc))
-
-    try:
-        await crew_manager.initialize()
-        logger.info("app.component_ready", component="crew_manager")
-    except Exception as exc:
-        logger.error("app.crew_manager_init_failed", error=str(exc))
+    for name, coro in [
+        ("database", database.initialize()),
+        ("cost_tracker", cost_tracker.initialize()),
+        ("cache", cache.initialize()),
+        ("crew_manager", crew_manager.initialize()),
+    ]:
+        try:
+            await asyncio.wait_for(coro, timeout=INIT_TIMEOUT)
+            logger.info("app.component_ready", component=name)
+        except asyncio.TimeoutError:
+            logger.error("app.component_timeout", component=name, timeout=INIT_TIMEOUT)
+        except Exception as exc:
+            logger.error(f"app.{name}_init_failed", error=str(exc))
 
     logger.info("app.startup_complete")
 
@@ -168,7 +166,12 @@ def create_app() -> FastAPI:
         summary="Health check",
     )
     async def health_check() -> HealthResponse:
-        """Return application health status and component readiness."""
+        """Return application health status and component readiness.
+
+        Always returns HTTP 200 so Railway's healthcheck passes once
+        uvicorn is accepting connections.  The ``status`` field indicates
+        whether all components are operational (``ok``) or not (``degraded``).
+        """
         components: dict[str, str] = {}
 
         # Check database
@@ -196,6 +199,8 @@ def create_app() -> FastAPI:
             else "degraded"
         )
 
+        # Always return 200 — Railway only needs the HTTP response to
+        # confirm the process is alive.  Component status is in the body.
         return HealthResponse(
             status=overall,
             version="0.1.0",
