@@ -34,6 +34,9 @@ from core.tools.deploy_tool import DeployTool
 
 logger = structlog.get_logger(__name__)
 
+# Maximum number of fix-and-retest iterations per feature / integration phase
+MAX_FIX_RETRIES = 3
+
 
 # ---------------------------------------------------------------------------
 # Workflow state
@@ -290,7 +293,7 @@ class WorkflowGraph:
         return state
 
     async def _phase_development(self, state: WorkflowState) -> WorkflowState:
-        """Development loop — implement features with GitHub commits and sandbox testing."""
+        """Development loop — implement features with GitHub commits, sandbox testing, and iterative correction."""
         for feature in state.features:
             if feature in state.completed_features:
                 continue
@@ -316,18 +319,72 @@ class WorkflowGraph:
                 blocking=True,
             )
 
-            # 4. Run generated tests in E2B sandbox
+            # 4. Run generated tests in E2B sandbox + correction loop
             if qa_output.content and not qa_output.metadata.get("is_batch"):
                 sandbox_result = await self._run_tests_in_sandbox(
                     test_code=qa_output.content,
                     source_code=state.code_artifacts,
                     feature_name=feature,
                 )
+
+                # ---- Iterative correction loop ----
+                current_code_output = dev_output
+                for attempt in range(1, MAX_FIX_RETRIES + 1):
+                    if sandbox_result["passed"]:
+                        break
+
+                    logger.warning(
+                        "workflow.tests_failed_retrying",
+                        feature=feature,
+                        attempt=attempt,
+                        max_retries=MAX_FIX_RETRIES,
+                        stderr=sandbox_result["stderr"][:300],
+                    )
+
+                    # Ask Dev Agent to fix the code based on test failures
+                    bug_description = (
+                        f"Tests failed for feature '{feature}'.\n"
+                        f"Test stderr:\n{sandbox_result['stderr'][:2000]}\n\n"
+                        f"Test stdout:\n{sandbox_result['stdout'][:2000]}"
+                    )
+                    fix_output = await self.dev_agent.fix_bug(
+                        bug_description=bug_description,
+                        code=current_code_output.content,
+                    )
+
+                    # Update artifacts with fixed code
+                    if fix_output.artifacts:
+                        state.code_artifacts.update(fix_output.artifacts)
+                        current_code_output = fix_output
+
+                        # Commit the fix to GitHub
+                        if state.github_repo_name:
+                            await self._commit_artifacts_to_github(
+                                state=state,
+                                files=fix_output.artifacts,
+                                message=f"fix: {feature} (attempt {attempt}/{MAX_FIX_RETRIES})",
+                            )
+
+                    # Re-run the same tests against fixed code
+                    sandbox_result = await self._run_tests_in_sandbox(
+                        test_code=qa_output.content,
+                        source_code=state.code_artifacts,
+                        feature_name=f"{feature} (fix attempt {attempt})",
+                    )
+
+                # Record final test result (passed or last failure)
                 state.sandbox_test_results.append(sandbox_result)
+                passed = sandbox_result["passed"]
                 state.test_results.append(
-                    f"[{feature}] {'PASSED' if sandbox_result['passed'] else 'FAILED'}: "
+                    f"[{feature}] {'PASSED' if passed else f'FAILED after {MAX_FIX_RETRIES} fix attempts'}: "
                     f"{sandbox_result['stdout'][:500]}"
                 )
+                if not passed:
+                    logger.error(
+                        "workflow.feature_tests_exhausted",
+                        feature=feature,
+                        retries=MAX_FIX_RETRIES,
+                    )
 
             # 5. Security Agent: dependency check
             sec_output = await self.security_agent.check_dependencies(
@@ -368,7 +425,7 @@ class WorkflowGraph:
         return state
 
     async def _phase_integration(self, state: WorkflowState) -> WorkflowState:
-        """Integration testing + full security audit."""
+        """Integration testing + full security audit, with iterative correction."""
         all_code = "\n\n".join(state.code_artifacts.values())
 
         # 1. QA Agent: generate integration tests (blocking)
@@ -379,14 +436,63 @@ class WorkflowGraph:
         )
         state.test_results.append(qa_output.content)
 
-        # 2. Run integration tests in E2B sandbox
+        # 2. Run integration tests in E2B sandbox + correction loop
         if qa_output.content:
             integration_result = await self._run_tests_in_sandbox(
                 test_code=qa_output.content,
                 source_code=state.code_artifacts,
                 feature_name="integration",
             )
+
+            # ---- Iterative correction loop for integration tests ----
+            for attempt in range(1, MAX_FIX_RETRIES + 1):
+                if integration_result["passed"]:
+                    break
+
+                logger.warning(
+                    "workflow.integration_tests_failed_retrying",
+                    attempt=attempt,
+                    max_retries=MAX_FIX_RETRIES,
+                    stderr=integration_result["stderr"][:300],
+                )
+
+                # Ask Dev Agent to fix based on integration test failures
+                bug_description = (
+                    f"Integration tests failed.\n"
+                    f"Test stderr:\n{integration_result['stderr'][:2000]}\n\n"
+                    f"Test stdout:\n{integration_result['stdout'][:2000]}"
+                )
+                fix_output = await self.dev_agent.fix_bug(
+                    bug_description=bug_description,
+                    code=all_code[:5000],
+                )
+
+                # Update artifacts with fixed code
+                if fix_output.artifacts:
+                    state.code_artifacts.update(fix_output.artifacts)
+                    all_code = "\n\n".join(state.code_artifacts.values())
+
+                    # Commit the fix to GitHub
+                    if state.github_repo_name:
+                        await self._commit_artifacts_to_github(
+                            state=state,
+                            files=fix_output.artifacts,
+                            message=f"fix: integration issues (attempt {attempt}/{MAX_FIX_RETRIES})",
+                        )
+
+                # Re-run integration tests against fixed code
+                integration_result = await self._run_tests_in_sandbox(
+                    test_code=qa_output.content,
+                    source_code=state.code_artifacts,
+                    feature_name=f"integration (fix attempt {attempt})",
+                )
+
             state.sandbox_test_results.append(integration_result)
+            if not integration_result["passed"]:
+                logger.error(
+                    "workflow.integration_tests_exhausted",
+                    retries=MAX_FIX_RETRIES,
+                )
 
         # 3. Full security audit on ALL code
         try:
