@@ -144,6 +144,7 @@ async def _run_workflow_background(
             project_id=project_id,
             product_idea=product_idea,
             target_market=target_market,
+            cache=cache,
         )
         final_state = {
             "current_phase": result.current_phase.value,
@@ -154,6 +155,8 @@ async def _run_workflow_background(
             "pending_batch_jobs": result.pending_batch_jobs,
             "errors": result.errors,
             "cost_report": result.cost_report,
+            "github_repo_url": result.github_repo_url,
+            "railway_deployment_url": result.railway_deployment_url,
         }
         _active_workflows[project_id] = final_state
         await _persist_to_redis(cache, project_id, final_state)

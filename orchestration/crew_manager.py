@@ -118,7 +118,7 @@ class CrewManager:
         product_idea: str,
         target_market: str = "B2B SaaS",
         human_callback: Any = None,
-        github_repo: str | None = None,
+        cache: MemoryCache | None = None,
     ) -> WorkflowState:
         """Run the full development workflow for a project."""
         if not self._initialized:
@@ -134,12 +134,31 @@ class CrewManager:
             target_market=target_market,
         )
 
-        # Use an existing GitHub repo if provided
-        if github_repo:
-            state.github_repo_name = github_repo
-            state.github_repo_url = f"https://github.com/{github_repo}"
+        # Build a phase callback that persists progress to Redis after each phase
+        async def _on_phase_update(s: WorkflowState) -> None:
+            if cache is None:
+                return
+            try:
+                await cache.set_json(
+                    f"workflow:{project_id}",
+                    {
+                        "current_phase": s.current_phase.value,
+                        "budget_ok": s.budget_ok,
+                        "design_approved": s.design_approved,
+                        "deploy_approved": s.deploy_approved,
+                        "completed_features": s.completed_features,
+                        "pending_batch_jobs": s.pending_batch_jobs,
+                        "errors": s.errors,
+                        "cost_report": s.cost_report,
+                        "github_repo_url": s.github_repo_url,
+                        "railway_deployment_url": s.railway_deployment_url,
+                    },
+                    ttl=86400,
+                )
+            except Exception as exc:
+                logger.warning("crew_manager.phase_persist_failed", error=str(exc))
 
-        result = await workflow.run(state)
+        result = await workflow.run(state, phase_callback=_on_phase_update)
 
         # Store result in cache
         await self._memory_cache.store_project_context(

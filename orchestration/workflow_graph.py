@@ -12,7 +12,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, TypedDict
+from typing import Any, Awaitable, Callable, TypedDict
 
 import structlog
 
@@ -146,8 +146,16 @@ class WorkflowGraph:
         """Set callback for human-in-the-loop decisions."""
         self._human_callback = callback
 
-    async def run(self, state: WorkflowState) -> WorkflowState:
-        """Execute the full workflow from start to finish."""
+    async def run(
+        self,
+        state: WorkflowState,
+        phase_callback: Callable[[WorkflowState], Awaitable[None]] | None = None,
+    ) -> WorkflowState:
+        """Execute the full workflow from start to finish.
+
+        ``phase_callback`` is awaited after every phase transition so callers
+        can persist real-time progress (e.g. to Redis).
+        """
         logger.info("workflow.started", project_id=self.project_id)
 
         phase_handlers = {
@@ -182,6 +190,13 @@ class WorkflowGraph:
                 )
                 state.errors.append(f"{state.current_phase.value}: {exc}")
                 state.current_phase = WorkflowPhase.FAILED
+
+            # Notify caller of phase change so it can persist progress
+            if phase_callback is not None:
+                try:
+                    await phase_callback(state)
+                except Exception as cb_exc:
+                    logger.warning("workflow.phase_callback_error", error=str(cb_exc))
 
         logger.info(
             "workflow.completed",

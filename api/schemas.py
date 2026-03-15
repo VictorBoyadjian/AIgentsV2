@@ -371,11 +371,6 @@ class WorkflowStartRequest(BaseModel):
         max_length=200,
         description="Target market segment.",
     )
-    github_repo: str | None = Field(
-        default=None,
-        max_length=200,
-        description="Existing GitHub repo (owner/name) to commit code into. If omitted, a new repo is created.",
-    )
 
 
 class WorkflowStatusResponse(BaseModel):
@@ -390,6 +385,8 @@ class WorkflowStatusResponse(BaseModel):
     pending_batch_jobs: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
     cost_report: str = ""
+    github_repo_url: str = ""
+    railway_deployment_url: str = ""
 
 
 # ---------------------------------------------------------------------------
