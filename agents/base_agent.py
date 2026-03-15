@@ -22,6 +22,7 @@ from core.cache_manager import CacheManager
 from core.config import AgentRole, BatchPriority, BudgetAlertLevel, TaskComplexity, get_settings
 from core.cost_tracker import CallCost, CostTracker
 from core.llm_router import LLMRouter
+from observability.langsmith_tracer import LangSmithTracer
 
 logger = structlog.get_logger(__name__)
 
@@ -110,6 +111,7 @@ class BaseAgent(ABC):
         self.cache_manager = cache_manager or CacheManager()
         self.cost_tracker = cost_tracker or CostTracker()
         self.batch_processor = batch_processor or BatchProcessor()
+        self._tracer = LangSmithTracer()
 
         self._system_prompt = self.cache_manager.get_system_prompt(role)
         self._project_context: str | None = None
@@ -161,42 +163,51 @@ class BaseAgent(ABC):
     # ------------------------------------------------------------------
     async def _execute_realtime(self, task: Task) -> AgentOutput:
         """Execute a task in real-time with caching and cost tracking."""
-        # Build the task-specific prompt
-        task_prompt = self._build_task_prompt(task)
-
-        # Call LLM with full tracking
-        content, cost = await self._call_llm_with_tracking(
-            current_task=task_prompt,
-            task_complexity=task.complexity,
-            existing_code=task.context.get("existing_code"),
-        )
-
-        # Parse output
-        artifacts = self._extract_artifacts(content)
-
-        # Self-reflect if quality matters
-        quality_score = None
-        if task.complexity in (TaskComplexity.COMPLEX, TaskComplexity.CRITICAL):
-            quality_score = await self._self_reflect(task, content)
-
-        output = AgentOutput(
-            task_id=task.id,
+        async with self._tracer.trace_agent_call(
             agent_role=self.role.value,
-            content=content,
-            artifacts=artifacts,
-            cost=cost,
-            quality_score=quality_score,
-        )
-
-        logger.info(
-            "agent.execute_complete",
-            agent=self.role.value,
             task_id=task.id,
-            cost_usd=round(cost.real_cost_usd, 6) if cost else 0,
-            quality=quality_score,
-        )
+            task_type=task.type.value,
+            complexity=task.complexity.value,
+            project_id=self.project_id,
+        ) as span:
+            # Build the task-specific prompt
+            task_prompt = self._build_task_prompt(task)
 
-        return output
+            # Call LLM with full tracking
+            content, cost = await self._call_llm_with_tracking(
+                current_task=task_prompt,
+                task_complexity=task.complexity,
+                existing_code=task.context.get("existing_code"),
+            )
+
+            # Parse output
+            artifacts = self._extract_artifacts(content)
+
+            # Self-reflect if quality matters
+            quality_score = None
+            if task.complexity in (TaskComplexity.COMPLEX, TaskComplexity.CRITICAL):
+                quality_score = await self._self_reflect(task, content)
+
+            output = AgentOutput(
+                task_id=task.id,
+                agent_role=self.role.value,
+                content=content,
+                artifacts=artifacts,
+                cost=cost,
+                quality_score=quality_score,
+            )
+
+            span.end(output_text=content[:500], quality_score=quality_score)
+
+            logger.info(
+                "agent.execute_complete",
+                agent=self.role.value,
+                task_id=task.id,
+                cost_usd=round(cost.real_cost_usd, 6) if cost else 0,
+                quality=quality_score,
+            )
+
+            return output
 
     # ------------------------------------------------------------------
     # Batch execution
@@ -287,12 +298,22 @@ class BaseAgent(ABC):
             messages.append({"role": "user", "content": "\n\n".join(context_parts)})
 
         # Call LLM with routing
-        content, usage_info = await self.llm_router.call_llm(
+        expected_model = force_model or self.llm_router.resolve_model(self.role.value, task_complexity)
+        async with self._tracer.trace_llm_call(
+            model=expected_model,
             agent_role=self.role.value,
-            messages=messages,
-            task_complexity=task_complexity,
-            force_model=force_model,
-        )
+        ) as llm_span:
+            content, usage_info = await self.llm_router.call_llm(
+                agent_role=self.role.value,
+                messages=messages,
+                task_complexity=task_complexity,
+                force_model=force_model,
+            )
+            llm_span.end(
+                output_text=content[:200],
+                input_tokens=usage_info.get("input_tokens", 0),
+                output_tokens=usage_info.get("output_tokens", 0),
+            )
 
         # Track cost
         model_used = usage_info.get("model", "unknown")

@@ -28,9 +28,12 @@ from core.batch_processor import BatchProcessor
 from core.cache_manager import CacheManager
 from core.config import get_settings, TaskComplexity
 from core.cost_tracker import CostTracker
+from core.llm_router import LLMRouter
 from core.tools.github_tool import GitHubTool
 from core.tools.code_sandbox import CodeSandbox
 from core.tools.deploy_tool import DeployTool
+from memory.rag_pipeline import RAGPipeline
+from memory.vector_store import VectorStore
 
 logger = structlog.get_logger(__name__)
 
@@ -120,25 +123,50 @@ class WorkflowGraph:
     downgrade to the emergency model automatically.
     """
 
-    def __init__(self, project_id: str) -> None:
+    def __init__(
+        self,
+        project_id: str,
+        llm_router: LLMRouter | None = None,
+        cost_tracker: CostTracker | None = None,
+        cache_manager: CacheManager | None = None,
+        batch_processor: BatchProcessor | None = None,
+        vector_store: VectorStore | None = None,
+    ) -> None:
         self.project_id = project_id
-        self.cost_tracker = CostTracker()
-        self.cache_manager = CacheManager()
-        self.batch_processor = BatchProcessor()
+        self.cost_tracker = cost_tracker or CostTracker()
+        self.cache_manager = cache_manager or CacheManager()
+        self.batch_processor = batch_processor or BatchProcessor()
 
-        # Initialize agents
-        self.research_agent = ResearchAgent(project_id=project_id)
-        self.pm_agent = PMAgent(project_id=project_id)
-        self.architect_agent = ArchitectAgent(project_id=project_id)
-        self.dev_agent = DevAgent(project_id=project_id)
-        self.qa_agent = QAAgent(project_id=project_id)
-        self.security_agent = SecurityAgent(project_id=project_id)
-        self.devops_agent = DevOpsAgent(project_id=project_id)
+        _llm_router = llm_router or LLMRouter()
+
+        # Shared kwargs for every agent — ensures one tracker/cache/router per workflow
+        _agent_kwargs = {
+            "llm_router": _llm_router,
+            "cache_manager": self.cache_manager,
+            "cost_tracker": self.cost_tracker,
+            "batch_processor": self.batch_processor,
+        }
+
+        # Initialize agents with shared infrastructure
+        self.research_agent = ResearchAgent(project_id=project_id, **_agent_kwargs)
+        self.pm_agent = PMAgent(project_id=project_id, **_agent_kwargs)
+        self.architect_agent = ArchitectAgent(project_id=project_id, **_agent_kwargs)
+        self.dev_agent = DevAgent(project_id=project_id, **_agent_kwargs)
+        self.qa_agent = QAAgent(project_id=project_id, **_agent_kwargs)
+        self.security_agent = SecurityAgent(project_id=project_id, **_agent_kwargs)
+        self.devops_agent = DevOpsAgent(project_id=project_id, **_agent_kwargs)
 
         # Tools for autonomous workflow
         self.github_tool = GitHubTool()
         self.code_sandbox = CodeSandbox()
         self.deploy_tool = DeployTool()
+
+        # RAG pipeline — only active when a VectorStore is provided
+        self._rag_pipeline: RAGPipeline | None = (
+            RAGPipeline(vector_store=vector_store, llm_router=_llm_router)
+            if vector_store is not None
+            else None
+        )
 
         self._human_callback: Any = None
 
@@ -157,6 +185,9 @@ class WorkflowGraph:
         can persist real-time progress (e.g. to Redis).
         """
         logger.info("workflow.started", project_id=self.project_id)
+
+        # Open the ResearchAgent's Redis connection before any phase runs.
+        await self.research_agent.initialize()
 
         phase_handlers = {
             WorkflowPhase.BUDGET_CHECK: self._phase_budget_check,
@@ -242,6 +273,18 @@ class WorkflowGraph:
             market=state.target_market,
         )
         state.research_output = output.content
+
+        # Index research output so downstream agents can query it via RAG
+        if self._rag_pipeline and state.research_output:
+            try:
+                await self._rag_pipeline.index_document(
+                    content=state.research_output,
+                    project_id=state.project_id,
+                    doc_type="research",
+                )
+            except Exception as exc:
+                logger.warning("workflow.rag_index_research_failed", error=str(exc))
+
         state.current_phase = WorkflowPhase.DESIGN
         return state
 
@@ -260,6 +303,25 @@ class WorkflowGraph:
 
         state.prd_doc = prd_output.content
         state.architecture_doc = arch_output.content
+
+        # Index design documents for RAG-based context enrichment in later phases
+        if self._rag_pipeline:
+            try:
+                await asyncio.gather(
+                    self._rag_pipeline.index_document(
+                        content=state.prd_doc,
+                        project_id=state.project_id,
+                        doc_type="prd",
+                    ),
+                    self._rag_pipeline.index_document(
+                        content=state.architecture_doc,
+                        project_id=state.project_id,
+                        doc_type="architecture",
+                    ),
+                    return_exceptions=True,
+                )
+            except Exception as exc:
+                logger.warning("workflow.rag_index_design_failed", error=str(exc))
 
         # Set context for downstream agents
         full_context = f"## PRD\n{state.prd_doc}\n\n## Architecture\n{state.architecture_doc}"
@@ -321,6 +383,24 @@ class WorkflowGraph:
 
     async def _phase_development(self, state: WorkflowState) -> WorkflowState:
         """Development loop — implement features with GitHub commits, sandbox testing, and iterative correction."""
+        # Enrich agent context with RAG-retrieved insights from research and design docs
+        if self._rag_pipeline and state.research_output:
+            try:
+                rag_context = await self._rag_pipeline.query(
+                    question=f"Key technical requirements and patterns for {state.product_idea}",
+                    project_id=state.project_id,
+                )
+                full_context = (
+                    f"## PRD\n{state.prd_doc}\n\n"
+                    f"## Architecture\n{state.architecture_doc}\n\n"
+                    f"## Research Insights\n{rag_context}"
+                )
+                self.dev_agent.set_project_context(full_context)
+                self.qa_agent.set_project_context(full_context)
+                self.security_agent.set_project_context(full_context)
+            except Exception as exc:
+                logger.warning("workflow.rag_enrich_dev_failed", error=str(exc))
+
         for feature in state.features:
             if feature in state.completed_features:
                 continue
@@ -330,6 +410,23 @@ class WorkflowGraph:
             # 1. Dev Agent: generate code (real-time)
             dev_output = await self.dev_agent.generate_code(feature=feature)
             state.code_artifacts.update(dev_output.artifacts)
+
+            # Index new code artifacts into vector store for cross-feature context
+            if self._rag_pipeline and dev_output.artifacts:
+                for filename, code in dev_output.artifacts.items():
+                    try:
+                        await self._rag_pipeline.index_document(
+                            content=code,
+                            project_id=state.project_id,
+                            doc_type="code",
+                            metadata={"filename": filename, "feature": feature},
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "workflow.rag_index_code_failed",
+                            filename=filename,
+                            error=str(exc),
+                        )
 
             # 2. Commit code artifacts to GitHub
             if state.github_repo_name and dev_output.artifacts:
@@ -523,6 +620,22 @@ class WorkflowGraph:
 
         # 3. Full security audit on ALL code
         try:
+            # Enrich security agent context with research insights via RAG
+            if self._rag_pipeline:
+                try:
+                    rag_context = await self._rag_pipeline.query(
+                        question="Security vulnerabilities and compliance requirements for SaaS applications",
+                        project_id=state.project_id,
+                        doc_type="research",
+                    )
+                    self.security_agent.set_project_context(
+                        f"## Research Context\n{rag_context}\n\n"
+                        f"## PRD\n{state.prd_doc}\n\n"
+                        f"## Architecture\n{state.architecture_doc}"
+                    )
+                except Exception as exc:
+                    logger.warning("workflow.rag_enrich_security_failed", error=str(exc))
+
             sec_output = await self.security_agent.audit_code(
                 code=all_code,
                 focus_areas="OWASP Top 10",
@@ -532,6 +645,17 @@ class WorkflowGraph:
                 "workflow.security_audit_complete",
                 findings_length=len(state.security_findings),
             )
+
+            # Index security findings for future RAG queries
+            if self._rag_pipeline and state.security_findings:
+                try:
+                    await self._rag_pipeline.index_document(
+                        content=state.security_findings,
+                        project_id=state.project_id,
+                        doc_type="security",
+                    )
+                except Exception as exc:
+                    logger.warning("workflow.rag_index_security_failed", error=str(exc))
         except Exception as exc:
             state.security_findings = f"Security audit failed: {exc}"
             state.errors.append(f"Security audit error: {exc}")

@@ -180,6 +180,8 @@ async def _run_workflow_background(
             "pending_batch_jobs": [],
             "errors": [str(exc)],
             "cost_report": "",
+            "github_repo_url": "",
+            "railway_deployment_url": "",
         }
         _active_workflows[project_id] = error_state
         await _persist_to_redis(cache, project_id, error_state)
@@ -232,6 +234,8 @@ async def start_workflow(
         "pending_batch_jobs": [],
         "errors": [],
         "cost_report": "",
+        "github_repo_url": "",
+        "railway_deployment_url": "",
     }
     _active_workflows[project_id] = initial_state
     await _persist_to_redis(cache, project_id, initial_state)
@@ -275,10 +279,12 @@ async def get_workflow_status(
             detail=f"Project '{project_id}' not found.",
         )
 
-    # Check in-memory first (same worker), fall back to Redis (other workers)
-    state = _active_workflows.get(project_id)
+    # Check Redis first — it is updated after every phase transition by the
+    # crew_manager phase callback, so it always holds the freshest state.
+    # Fall back to the in-memory dict only when Redis is unavailable.
+    state = await cache.get_json(f"workflow:{project_id}")
     if state is None:
-        state = await cache.get_json(f"workflow:{project_id}")
+        state = _active_workflows.get(project_id)
     if state is None:
         return WorkflowStatusResponse(
             project_id=project_id,
@@ -295,4 +301,6 @@ async def get_workflow_status(
         pending_batch_jobs=state.get("pending_batch_jobs", []),
         errors=state.get("errors", []),
         cost_report=state.get("cost_report", ""),
+        github_repo_url=state.get("github_repo_url", ""),
+        railway_deployment_url=state.get("railway_deployment_url", ""),
     )

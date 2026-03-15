@@ -124,7 +124,14 @@ class CrewManager:
         if not self._initialized:
             await self.initialize()
 
-        workflow = WorkflowGraph(project_id=project_id)
+        workflow = WorkflowGraph(
+            project_id=project_id,
+            llm_router=self._llm_router,
+            cost_tracker=self._cost_tracker,
+            cache_manager=self._cache_manager,
+            batch_processor=self._batch_processor,
+            vector_store=self._vector_store,
+        )
         if human_callback:
             workflow.set_human_callback(human_callback)
 
