@@ -118,6 +118,7 @@ class CrewManager:
         product_idea: str,
         target_market: str = "B2B SaaS",
         human_callback: Any = None,
+        github_repo: str | None = None,
     ) -> WorkflowState:
         """Run the full development workflow for a project."""
         if not self._initialized:
@@ -132,6 +133,11 @@ class CrewManager:
             product_idea=product_idea,
             target_market=target_market,
         )
+
+        # Use an existing GitHub repo if provided
+        if github_repo:
+            state.github_repo_name = github_repo
+            state.github_repo_url = f"https://github.com/{github_repo}"
 
         result = await workflow.run(state)
 

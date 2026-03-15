@@ -279,8 +279,20 @@ class WorkflowGraph:
             state.design_approved = True
 
         if state.design_approved:
-            # Create GitHub repository for the project
-            await self._setup_github_repo(state)
+            # Create GitHub repository (or skip if an existing repo was provided)
+            if not state.github_repo_name:
+                await self._setup_github_repo(state)
+            else:
+                logger.info("workflow.using_existing_repo", repo=state.github_repo_name)
+                # Commit initial docs to existing repo
+                await self._commit_artifacts_to_github(
+                    state=state,
+                    files={
+                        "docs/PRD.md": state.prd_doc,
+                        "docs/ARCHITECTURE.md": state.architecture_doc,
+                    },
+                    message="docs: add PRD and architecture documents",
+                )
 
             # Warm cache with new context
             full_context = f"## PRD\n{state.prd_doc}\n\n## Architecture\n{state.architecture_doc}"

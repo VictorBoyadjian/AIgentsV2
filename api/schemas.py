@@ -371,6 +371,11 @@ class WorkflowStartRequest(BaseModel):
         max_length=200,
         description="Target market segment.",
     )
+    github_repo: str | None = Field(
+        default=None,
+        max_length=200,
+        description="Existing GitHub repo (owner/name) to commit code into. If omitted, a new repo is created.",
+    )
 
 
 class WorkflowStatusResponse(BaseModel):

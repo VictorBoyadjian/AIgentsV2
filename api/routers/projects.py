@@ -13,7 +13,7 @@ from typing import Any
 import structlog
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 
-from api.dependencies import get_crew_manager, get_database, get_human_in_loop
+from api.dependencies import get_cache, get_crew_manager, get_database, get_human_in_loop
 from api.schemas import (
     CheckpointResolveRequest,
     CheckpointResponse,
@@ -23,6 +23,7 @@ from api.schemas import (
     WorkflowStartRequest,
     WorkflowStatusResponse,
 )
+from memory.cache import MemoryCache
 from memory.database import Database
 from orchestration.crew_manager import CrewManager
 from orchestration.human_in_loop import HumanInTheLoop
@@ -115,6 +116,17 @@ async def get_project(
     return ProjectResponse.model_validate(record)
 
 
+_WORKFLOW_TTL = 86400  # 24 hours
+
+
+async def _persist_to_redis(cache: MemoryCache, project_id: str, state: dict) -> None:
+    """Write workflow state to Redis so all workers can read it."""
+    try:
+        await cache.set_json(f"workflow:{project_id}", state, ttl=_WORKFLOW_TTL)
+    except Exception as exc:
+        logger.warning("api.workflow_redis_persist_failed", error=str(exc))
+
+
 # ---------------------------------------------------------------------------
 # POST /projects/{project_id}/workflow  -- start workflow
 # ---------------------------------------------------------------------------
@@ -123,6 +135,7 @@ async def _run_workflow_background(
     product_idea: str,
     target_market: str,
     crew_manager: CrewManager,
+    cache: MemoryCache,
 ) -> None:
     """Run the full development workflow in a background task."""
     try:
@@ -132,7 +145,7 @@ async def _run_workflow_background(
             product_idea=product_idea,
             target_market=target_market,
         )
-        _active_workflows[project_id] = {
+        final_state = {
             "current_phase": result.current_phase.value,
             "budget_ok": result.budget_ok,
             "design_approved": result.design_approved,
@@ -142,6 +155,8 @@ async def _run_workflow_background(
             "errors": result.errors,
             "cost_report": result.cost_report,
         }
+        _active_workflows[project_id] = final_state
+        await _persist_to_redis(cache, project_id, final_state)
         logger.info(
             "api.workflow_background_complete",
             project_id=project_id,
@@ -153,7 +168,7 @@ async def _run_workflow_background(
             project_id=project_id,
             error=str(exc),
         )
-        _active_workflows[project_id] = {
+        error_state = {
             "current_phase": "failed",
             "budget_ok": False,
             "design_approved": False,
@@ -163,6 +178,8 @@ async def _run_workflow_background(
             "errors": [str(exc)],
             "cost_report": "",
         }
+        _active_workflows[project_id] = error_state
+        await _persist_to_redis(cache, project_id, error_state)
 
 
 @router.post(
@@ -177,6 +194,7 @@ async def start_workflow(
     background_tasks: BackgroundTasks,
     db: Database = Depends(get_database),
     crew_manager: CrewManager = Depends(get_crew_manager),
+    cache: MemoryCache = Depends(get_cache),
 ) -> WorkflowStatusResponse:
     """Start the full SaaS development workflow for a project.
 
@@ -191,16 +209,18 @@ async def start_workflow(
             detail=f"Project '{project_id}' not found.",
         )
 
-    if project_id in _active_workflows:
-        current = _active_workflows[project_id]
-        if current.get("current_phase") not in ("completed", "failed"):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="A workflow is already running for this project.",
-            )
+    # Check for an already-running workflow (in-memory OR Redis for multi-worker)
+    current = _active_workflows.get(project_id)
+    if current is None:
+        current = await cache.get_json(f"workflow:{project_id}")
+    if current and current.get("current_phase") not in ("completed", "failed"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A workflow is already running for this project.",
+        )
 
-    # Mark as starting
-    _active_workflows[project_id] = {
+    # Mark as starting — write to both in-memory and Redis
+    initial_state: dict = {
         "current_phase": "budget_check",
         "budget_ok": True,
         "design_approved": False,
@@ -210,6 +230,8 @@ async def start_workflow(
         "errors": [],
         "cost_report": "",
     }
+    _active_workflows[project_id] = initial_state
+    await _persist_to_redis(cache, project_id, initial_state)
 
     background_tasks.add_task(
         _run_workflow_background,
@@ -217,6 +239,7 @@ async def start_workflow(
         body.product_idea,
         body.target_market,
         crew_manager,
+        cache,
     )
 
     logger.info("api.workflow_started", project_id=project_id)
@@ -238,6 +261,7 @@ async def start_workflow(
 async def get_workflow_status(
     project_id: str,
     db: Database = Depends(get_database),
+    cache: MemoryCache = Depends(get_cache),
 ) -> WorkflowStatusResponse:
     """Get the current status of a project's development workflow."""
     # Verify project exists
@@ -248,7 +272,10 @@ async def get_workflow_status(
             detail=f"Project '{project_id}' not found.",
         )
 
+    # Check in-memory first (same worker), fall back to Redis (other workers)
     state = _active_workflows.get(project_id)
+    if state is None:
+        state = await cache.get_json(f"workflow:{project_id}")
     if state is None:
         return WorkflowStatusResponse(
             project_id=project_id,
